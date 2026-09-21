@@ -1,18 +1,108 @@
-"""封装 Google ADK 的 Runner / Session，支持真流式输出。
+"""封装 Google ADK 的 Runner / Session。
 
-关键改动：
-    在 runner.run_async() 中传入 RunConfig(streaming_mode=StreamingMode.SSE)，
-    这样 ADK 会 yield partial=True 的增量事件，而非只返回 final event。
+Reasoning 泄漏过滤（保守版）：
+    只在**开头明确是推理句式**时才切。
+    特征：
+        - "The user ..."
+        - "I should ..."
+        - "Let me ..."
+        - "First, I ..."
+        - "Okay, ..." / "Hmm, ..." / "Wait, ..."
+
+    切到**第一个空行**就停。
+    遇到中文立即停。
+    其他情况原样返回（宁可留泄漏，也不误删内容）。
 """
 
+import re
 from typing import Any, Callable, Dict, Optional
 
 from google.adk.agents import Agent
-from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
+
+# ============================================================
+# 明确推理句式（大小写不敏感）
+# ============================================================
+_REASONING_PATTERNS = [
+    re.compile(r"^The user\s+(?:just|is|said|wants|asks|has)", re.IGNORECASE),
+    re.compile(r"^I\s+(?:should|need|will|must|can|am going to|have to)", re.IGNORECASE),
+    re.compile(r"^Let me\s+", re.IGNORECASE),
+    re.compile(r"^First,\s+I\s+", re.IGNORECASE),
+    re.compile(r"^Okay,\s+(?:I|let)", re.IGNORECASE),
+    re.compile(r"^Hmm,\s+", re.IGNORECASE),
+    re.compile(r"^Wait,\s+", re.IGNORECASE),
+    re.compile(r"^Alright,\s+(?:I|let)", re.IGNORECASE),
+    re.compile(r"^Now,\s+I\s+", re.IGNORECASE),
+]
+
+
+def _looks_like_reasoning(text: str) -> bool:
+    """判断文本开头是否像推理。"""
+    if not text:
+        return False
+    first_line = text.split("\n", 1)[0].strip()
+    for pat in _REASONING_PATTERNS:
+        if pat.match(first_line):
+            return True
+    return False
+
+
+def _strip_reasoning(text: str) -> str:
+    """剥离 LLM 推理泄漏（保守版）。
+
+    只在**开头明确是推理句式**时切，遇到第一个空行就停。
+    其他情况**原样返回**。
+    """
+    if not text:
+        return text
+
+    stripped = text.lstrip()
+
+    # 不以推理句式开头 → 原样返回
+    if not _looks_like_reasoning(stripped):
+        return text
+
+    # 找第一个空行（\n\n）作为切分点
+    lines = stripped.split("\n")
+
+    for i, line in enumerate(lines):
+        s = line.strip()
+
+        # 遇到空行 → 认为是段落分隔
+        if not s:
+            rest = "\n".join(lines[i + 1:]).strip()
+            if rest:
+                return rest
+            break
+
+        # 遇到中文 → 认为正式内容开始
+        if any("\u4e00" <= ch <= "\u9fff" for ch in s):
+            rest = "\n".join(lines[i:]).strip()
+            if rest:
+                return rest
+            break
+
+        # 遇到 markdown 结构 → 认为正式内容开始
+        if s.startswith(("#", "- ", "* ", "|", "```", "1. ", "2. ")):
+            rest = "\n".join(lines[i:]).strip()
+            if rest:
+                return rest
+            break
+
+        # 只检查前 5 行（超过就不是纯推理了）
+        if i >= 5:
+            return text
+
+    # 兜底：没找到切分点 → 原样返回（宁可留泄漏）
+    return text
+
+
+# ============================================================
+# AgentCaller
+# ============================================================
 
 class AgentCaller:
     """一个 Agent + 一个会话的轻量封装。"""
@@ -25,7 +115,6 @@ class AgentCaller:
         session_id: str,
         session_service: InMemorySessionService,
         app_name: str,
-        streaming: bool = True,          # ★ 新增：是否启用流式
     ):
         self.agent = agent
         self.runner = runner
@@ -33,49 +122,23 @@ class AgentCaller:
         self.session_id = session_id
         self.session_service = session_service
         self.app_name = app_name
-        self.streaming = streaming
 
-    # ========================================================
-    # chat（真流式版）
-    # ========================================================
     async def chat(
         self,
         user_input: str,
         verbose: bool = False,
         on_chunk: Optional[Callable[[str], None]] = None,
     ) -> str:
-        """发送消息并获取回复。
-
-        Args:
-            user_input: 用户输入
-            verbose: 是否打印每个事件
-            on_chunk: 流式增量回调。当 streaming=True 时，
-                      每收到一个 partial 文本片段就会调用一次。
-                      在 bridge 线程中被调用，UI 层需自行 after(0, ...)。
-
-        Returns:
-            完整的最终响应文本。
-        """
         message = types.Content(
             role="user", parts=[types.Part(text=user_input)]
         )
 
-        # ★ 关键：构造 RunConfig
-        run_config = RunConfig(
-            streaming_mode=(
-                StreamingMode.SSE if self.streaming
-                else StreamingMode.NONE
-            ),
-        )
-
         final_text = ""
-        has_streamed = False
 
         async for event in self.runner.run_async(
             user_id=self.user_id,
             session_id=self.session_id,
             new_message=message,
-            run_config=run_config,           # ★ 传入 RunConfig
         ):
             if verbose:
                 print(
@@ -84,7 +147,6 @@ class AgentCaller:
                     f"partial={getattr(event, 'partial', False)}"
                 )
 
-            # ---------- 提取文本 ----------
             text = ""
             if event.content and event.content.parts:
                 for part in event.content.parts:
@@ -94,35 +156,34 @@ class AgentCaller:
 
             if text:
                 is_partial = bool(getattr(event, "partial", False))
-                is_final = bool(event.is_final_response())
 
-                # ★ partial 事件：流式增量
                 if is_partial and on_chunk:
                     on_chunk(text)
-                    has_streamed = True
 
-                if is_final:
+                if event.is_final_response():
                     final_text = text
                 elif is_partial:
                     final_text += text
 
-            # 处理 escalate
             if getattr(event, "actions", None) and getattr(
                 event.actions, "escalate", False
             ):
                 break
 
+        # 过滤 reasoning 泄漏
+        cleaned = _strip_reasoning(final_text)
+
         if verbose:
-            print(
-                f"[AgentCaller] has_streamed={has_streamed} "
-                f"final_len={len(final_text)}"
-            )
+            if cleaned != final_text:
+                print(
+                    f"[AgentCaller] 剥离 reasoning："
+                    f"{len(final_text)} → {len(cleaned)} 字符"
+                )
+            else:
+                print(f"[AgentCaller] 无 reasoning 需要剥离")
 
-        return final_text
+        return cleaned
 
-    # ========================================================
-    # get_session
-    # ========================================================
     async def get_session(self):
         return await self.runner.session_service.get_session(
             app_name=self.runner.app_name,
@@ -139,7 +200,6 @@ async def make_agent_caller(
     agent: Agent,
     app_name: Optional[str] = None,
     initial_state: Optional[Dict[str, Any]] = None,
-    streaming: bool = True,              # ★ 新增参数
 ) -> AgentCaller:
     app_name = app_name or f"{agent.name}_app"
     user_id = f"{agent.name}_user"
@@ -160,5 +220,4 @@ async def make_agent_caller(
         session_id=session_id,
         session_service=service,
         app_name=app_name,
-        streaming=streaming,
     )

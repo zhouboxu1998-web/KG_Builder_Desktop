@@ -7,7 +7,7 @@ from kg_builder.ui.panels.base_panel import BasePanel
 
 
 class FactPanel(BasePanel):
-    title = "⑤ 事实类型"
+    title = "5.事实类型"
     subtitle = "提议 (主语, 谓语, 宾语) 关系"
 
     def __init__(self, master, bridge, pipeline, **kwargs):

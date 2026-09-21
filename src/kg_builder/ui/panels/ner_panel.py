@@ -5,7 +5,7 @@ from kg_builder.ui.panels.base_panel import BasePanel
 
 
 class NerPanel(BasePanel):
-    title = "④ 实体识别（NER）"
+    title = "4.实体识别（NER）"
     subtitle = "从 Markdown 评论中提议实体类型"
 
     def __init__(self, master, bridge, pipeline, **kwargs):

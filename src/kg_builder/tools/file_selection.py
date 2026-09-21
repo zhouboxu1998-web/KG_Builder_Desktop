@@ -1,121 +1,161 @@
-"""文件选择：建议 → 获取 → 批准（结构化/非结构化分离版）。"""
+"""文件选择工具：拆分为"结构化"和"非结构化"两套。
+
+状态键：
+    结构化：
+        - suggested_structured_files
+        - approved_structured_files
+    非结构化：
+        - suggested_unstructured_files
+        - approved_unstructured_files
+    兼容（旧）：
+        - suggested_files / approved_files
+"""
 
 from typing import Any, Dict, List
 
 from google.adk.tools import ToolContext
 
 from kg_builder.core.neo4j_client import tool_error, tool_success
-from kg_builder.state import APPROVED_FILES, SUGGESTED_FILES
-from kg_builder.tools.goal_tools import get_approved_user_goal  # noqa
+from kg_builder.state import (
+    APPROVED_FILES,
+    APPROVED_STRUCTURED_FILES,
+    APPROVED_UNSTRUCTURED_FILES,
+    SUGGESTED_FILES,
+    SUGGESTED_STRUCTURED_FILES,
+    SUGGESTED_UNSTRUCTURED_FILES,
+)
+from kg_builder.tools.file_tools import list_available_files  # noqa: F401
 
 
-# 新增状态键
-APPROVED_STRUCTURED_FILES = "approved_structured_files"
-APPROVED_UNSTRUCTURED_FILES = "approved_unstructured_files"
-SUGGESTED_STRUCTURED_FILES = "suggested_structured_files"
-SUGGESTED_UNSTRUCTURED_FILES = "suggested_unstructured_files"
+# ============================================================
+# 一、结构化文件工具
+# ============================================================
 
-
-STRUCTURED_EXTS = (".csv", ".json", ".parquet", ".xlsx")
-UNSTRUCTURED_EXTS = (".md", ".markdown", ".txt", ".pdf")
-
-
-def _classify(files: List[str]) -> tuple:
-    """按后缀分类。"""
-    s, u, other = [], [], []
-    for f in files:
-        fl = f.lower()
-        if fl.endswith(STRUCTURED_EXTS):
-            s.append(f)
-        elif fl.endswith(UNSTRUCTURED_EXTS):
-            u.append(f)
-        else:
-            other.append(f)
-    return s, u, other
-
-
-def set_suggested_files(
-    structured_files: List[str],
-    unstructured_files: List[str],
+def set_suggested_structured_files(
+    suggest_files: List[str],
     tool_context: ToolContext,
 ) -> dict:
-    """分别设置结构化和非结构化的建议文件。
+    """设置"建议的结构化文件"列表（CSV / JSON）。
 
     Args:
-        structured_files: 结构化建议（CSV/JSON）
-        unstructured_files: 非结构化建议（MD/TXT）
+        suggest_files: 建议的文件相对路径列表
     """
-    if not structured_files and not unstructured_files:
-        return tool_error("两个文件列表都为空。请重新推荐。")
+    if not suggest_files:
+        return tool_error(
+            "传入的结构化文件列表为空！请先调用 list_available_files。"
+        )
 
-    # 合并版（兼容）
-    all_files = list(structured_files or []) + list(unstructured_files or [])
-    tool_context.state[SUGGESTED_FILES] = all_files
+    # 只保留 .csv / .json / .parquet / .xlsx
+    valid_exts = (".csv", ".json", ".parquet", ".xlsx")
+    cleaned = [
+        f for f in suggest_files
+        if isinstance(f, str) and f.lower().endswith(valid_exts)
+    ]
+    if not cleaned:
+        return tool_error(
+            "传入的文件没有 .csv/.json 类型。请检查后重试。"
+        )
 
-    # 分类版（新增）
-    tool_context.state[SUGGESTED_STRUCTURED_FILES] = list(structured_files or [])
-    tool_context.state[SUGGESTED_UNSTRUCTURED_FILES] = list(unstructured_files or [])
-
-    return tool_success(SUGGESTED_FILES, {
-        "structured": structured_files or [],
-        "unstructured": unstructured_files or [],
-    })
-
-
-def get_suggested_files(tool_context: ToolContext) -> Dict[str, Any]:
-    return tool_success(SUGGESTED_FILES, {
-        "structured": tool_context.state.get(SUGGESTED_STRUCTURED_FILES, []),
-        "unstructured": tool_context.state.get(SUGGESTED_UNSTRUCTURED_FILES, []),
-    })
+    tool_context.state[SUGGESTED_STRUCTURED_FILES] = cleaned
+    return tool_success(SUGGESTED_STRUCTURED_FILES, cleaned)
 
 
-def approve_suggested_files(tool_context: ToolContext) -> Dict[str, Any]:
-    """批准建议文件，分类转正。"""
-    if SUGGESTED_FILES not in tool_context.state:
-        return tool_error("没有可批准的建议文件。")
-
-    # 兼容版
-    tool_context.state[APPROVED_FILES] = tool_context.state[SUGGESTED_FILES]
-
-    # 分类版
-    tool_context.state[APPROVED_STRUCTURED_FILES] = tool_context.state.get(
-        SUGGESTED_STRUCTURED_FILES, []
-    )
-    tool_context.state[APPROVED_UNSTRUCTURED_FILES] = tool_context.state.get(
-        SUGGESTED_UNSTRUCTURED_FILES, []
-    )
-
-    return tool_success(APPROVED_FILES, {
-        "structured": tool_context.state[APPROVED_STRUCTURED_FILES],
-        "unstructured": tool_context.state[APPROVED_UNSTRUCTURED_FILES],
-    })
+def get_suggested_structured_files(tool_context: ToolContext) -> dict:
+    files = tool_context.state.get(SUGGESTED_STRUCTURED_FILES, [])
+    if not files:
+        return tool_error("尚未设置结构化建议文件。")
+    return tool_success(SUGGESTED_STRUCTURED_FILES, files)
 
 
-# ============================================================
-# 新增：分类读取工具
-# ============================================================
+def approve_suggested_structured_files(tool_context: ToolContext) -> dict:
+    """把"建议的结构化文件"转为"已批准"。"""
+    if SUGGESTED_STRUCTURED_FILES not in tool_context.state:
+        return tool_error("没有可批准的结构化文件建议。")
 
-def get_approved_structured_files(tool_context: ToolContext) -> Dict[str, Any]:
-    """获取已批准的结构化文件（CSV / JSON）。"""
+    approved = list(tool_context.state[SUGGESTED_STRUCTURED_FILES])
+    tool_context.state[APPROVED_STRUCTURED_FILES] = approved
+    return tool_success(APPROVED_STRUCTURED_FILES, approved)
+
+
+def get_approved_structured_files(tool_context: ToolContext) -> dict:
     files = tool_context.state.get(APPROVED_STRUCTURED_FILES, [])
     if not files:
-        # 兜底：如果分类列表不存在，从合并列表里过滤
-        merged = tool_context.state.get(APPROVED_FILES, [])
-        files = [f for f in merged if f.lower().endswith(STRUCTURED_EXTS)]
+        return tool_error(
+            "尚未批准任何结构化文件。请先推荐并批准。"
+        )
     return tool_success(APPROVED_STRUCTURED_FILES, files)
 
 
-def get_approved_unstructured_files(tool_context: ToolContext) -> Dict[str, Any]:
-    """获取已批准的非结构化文件（MD / TXT）。"""
+# ============================================================
+# 二、非结构化文件工具
+# ============================================================
+
+def set_suggested_unstructured_files(
+    suggest_files: List[str],
+    tool_context: ToolContext,
+) -> dict:
+    """设置"建议的非结构化文件"列表（MD / TXT）。"""
+    if not suggest_files:
+        return tool_error(
+            "传入的非结构化文件列表为空！请先调用 list_available_files。"
+        )
+
+    valid_exts = (".md", ".markdown", ".txt", ".pdf")
+    cleaned = [
+        f for f in suggest_files
+        if isinstance(f, str) and f.lower().endswith(valid_exts)
+    ]
+    if not cleaned:
+        return tool_error(
+            "传入的文件没有 .md/.txt 类型。请检查后重试。"
+        )
+
+    tool_context.state[SUGGESTED_UNSTRUCTURED_FILES] = cleaned
+    return tool_success(SUGGESTED_UNSTRUCTURED_FILES, cleaned)
+
+
+def get_suggested_unstructured_files(tool_context: ToolContext) -> dict:
+    files = tool_context.state.get(SUGGESTED_UNSTRUCTURED_FILES, [])
+    if not files:
+        return tool_error("尚未设置非结构化建议文件。")
+    return tool_success(SUGGESTED_UNSTRUCTURED_FILES, files)
+
+
+def approve_suggested_unstructured_files(tool_context: ToolContext) -> dict:
+    if SUGGESTED_UNSTRUCTURED_FILES not in tool_context.state:
+        return tool_error("没有可批准的非结构化文件建议。")
+
+    approved = list(tool_context.state[SUGGESTED_UNSTRUCTURED_FILES])
+    tool_context.state[APPROVED_UNSTRUCTURED_FILES] = approved
+    return tool_success(APPROVED_UNSTRUCTURED_FILES, approved)
+
+
+def get_approved_unstructured_files(tool_context: ToolContext) -> dict:
     files = tool_context.state.get(APPROVED_UNSTRUCTURED_FILES, [])
     if not files:
-        merged = tool_context.state.get(APPROVED_FILES, [])
-        files = [f for f in merged if f.lower().endswith(UNSTRUCTURED_EXTS)]
+        return tool_error(
+            "尚未批准任何非结构化文件。请先推荐并批准。"
+        )
     return tool_success(APPROVED_UNSTRUCTURED_FILES, files)
 
 
-# 兼容：保留原 get_approved_files（合并版）
+# ============================================================
+# 三、兼容工具（旧接口，保留但不推荐）
+# ============================================================
+
 def get_approved_files(tool_context: ToolContext) -> dict:
+    """兼容：返回合并版已批准文件。"""
     if APPROVED_FILES not in tool_context.state:
         return tool_error("未设置 approved_files。")
     return tool_success(APPROVED_FILES, tool_context.state[APPROVED_FILES])
+
+
+def sync_merged_approved_files(tool_context: ToolContext) -> None:
+    """把两个分类列表合并写入 approved_files（兼容旧逻辑）。
+
+    在 approve_*_structured_files 和 approve_*_unstructured_files
+    之后由调用方显式触发，或者由 pipeline 自动调用。
+    """
+    s = tool_context.state.get(APPROVED_STRUCTURED_FILES, [])
+    u = tool_context.state.get(APPROVED_UNSTRUCTURED_FILES, [])
+    tool_context.state[APPROVED_FILES] = list(s) + list(u)

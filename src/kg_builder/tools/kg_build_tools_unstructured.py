@@ -1,26 +1,17 @@
-"""非结构化图谱构建：从 Markdown 文件抽取实体和关系。
+"""非结构化图谱构建：手写 prompt + 关闭结构化输出。
 
-对应 knowledge_graph_construction_2.ipynb 的核心逻辑：
-    1. 自定义 RegexTextSplitter（按 --- 切分评论）
-    2. 自定义 MarkdownDataLoader（读 .md 文件）
-    3. 把 approved_entity_types / approved_fact_types 转成 entity_schema
-    4. 为每个文件构造 SimpleKGPipeline 并执行
+核心：
+    - 使用我们自定义的简洁 prompt（原始 notebook 版本）
+    - LLMEntityRelationExtractor(use_structured_output=False)
+    - 兼容 neo4j-graphrag 1.14+ / 1.19.0 的 import 路径
 """
 
-import os
+import importlib
+import inspect
 import re
+import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-
-from neo4j_graphrag.experimental.components.pdf_loader import DataLoader
-from neo4j_graphrag.experimental.components.text_splitters.base import TextSplitter
-from neo4j_graphrag.experimental.components.types import (
-    DocumentInfo,
-    PdfDocument,
-    TextChunk,
-    TextChunks,
-)
-from neo4j_graphrag.experimental.pipeline.kg_builder import SimpleKGPipeline
 
 from kg_builder import config
 from kg_builder.core.neo4j_graphrag import (
@@ -31,62 +22,101 @@ from kg_builder.core.neo4j_graphrag import (
 
 
 # ============================================================
-# 自定义组件
+# 一、兼容多版本导入
 # ============================================================
 
-class RegexTextSplitter(TextSplitter):
-    """按正则分隔符切分文本。"""
-
-    def __init__(self, pattern: str = "---"):
-        self.pattern = pattern
-
-    async def run(self, text: str) -> TextChunks:
-        parts = re.split(self.pattern, text)
-        chunks = [
-            TextChunk(text=str(part), index=i)
-            for i, part in enumerate(parts)
-        ]
-        return TextChunks(chunks=chunks)
+def _import_any(module_paths: List[str], class_name: str):
+    """从多个模块路径尝试导入同一个类。"""
+    for mp in module_paths:
+        try:
+            mod = importlib.import_module(mp)
+            if hasattr(mod, class_name):
+                return getattr(mod, class_name)
+        except ImportError:
+            continue
+    raise ImportError(f"找不到 {class_name}，尝试过: {module_paths}")
 
 
-class MarkdownDataLoader(DataLoader):
-    """加载 Markdown 文件，自动提取一级标题作为文档标题。"""
+# 文本切分器
+TextSplitter = _import_any(
+    [
+        "neo4j_graphrag.components.text_splitters.base",
+        "neo4j_graphrag.experimental.components.text_splitters.base",
+    ],
+    "TextSplitter",
+)
 
-    @staticmethod
-    def _extract_title(md_text: str) -> str:
-        match = re.search(r"^# (.+)$", md_text, re.MULTILINE)
-        return match.group(1) if match else "Untitled"
+# 类型
+_types_mod = None
+for _p in [
+    "neo4j_graphrag.components.types",
+    "neo4j_graphrag.experimental.components.types",
+]:
+    try:
+        _types_mod = importlib.import_module(_p)
+        break
+    except ImportError:
+        continue
+if _types_mod is None:
+    raise ImportError("找不到 types 模块")
 
-    async def run(self, filepath: Path, metadata: dict = None) -> PdfDocument:
-        with open(filepath, "r", encoding="utf-8") as f:
-            md_text = f.read()
+TextChunk = _types_mod.TextChunk
+TextChunks = _types_mod.TextChunks
 
-        title = self._extract_title(md_text)
-        info = DocumentInfo(
-            path=str(filepath),
-            metadata={"title": title},
-        )
-        return PdfDocument(text=md_text, document_info=info)
+# 实体关系抽取器
+_er_mod = None
+for _p in [
+    "neo4j_graphrag.components.entity_relation_extractor",
+    "neo4j_graphrag.experimental.components.entity_relation_extractor",
+]:
+    try:
+        _er_mod = importlib.import_module(_p)
+        break
+    except ImportError:
+        continue
+if _er_mod is None:
+    raise ImportError("找不到 entity_relation_extractor 模块")
+
+LLMEntityRelationExtractor = _er_mod.LLMEntityRelationExtractor
+OnError = getattr(_er_mod, "OnError", None)
+
+# Writer
+Neo4jWriter = _import_any(
+    [
+        "neo4j_graphrag.components.kg_writer",
+        "neo4j_graphrag.experimental.components.kg_writer",
+        "neo4j_graphrag.experimental.components.neo4j_writer",
+    ],
+    "Neo4jWriter",
+)
 
 
 # ============================================================
-# 上下文提取 + Prompt 构造
+# 二、参数过滤工具
 # ============================================================
 
-def file_context(file_path: str, num_lines: int = 5) -> str:
-    """读取文件前几行作为上下文。"""
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = []
-        for _ in range(num_lines):
-            line = f.readline()
-            if not line:
-                break
-            lines.append(line)
-    return "\n".join(lines)
+def _filter_kwargs(cls, **candidates):
+    """只保留目标类 __init__ 签名中实际存在的参数。"""
+    try:
+        sig = inspect.signature(cls.__init__)
+        valid = set(sig.parameters.keys())
+    except Exception:
+        valid = set(candidates.keys())
+    return {k: v for k, v in candidates.items() if k in valid}
 
+
+# ============================================================
+# 三、★ 自定义 prompt（原始简洁版）
+# ============================================================
 
 def contextualize_er_extraction_prompt(context: str) -> str:
-    """构造带有文件上下文的实体/关系抽取 Prompt。"""
+    """构造带有文件上下文的实体/关系抽取 Prompt（原始简洁版）。
+
+    注意：
+        - 保留 {schema} 和 {text} 占位符，库会替换它们
+        - 返回的字符串将作为 LLMEntityRelationExtractor 的 prompt_template
+    """
+
     general_instructions = """
     你是一种顶级的信息抽取算法，专门用于以结构化格式提取信息，以构建知识图谱。
 
@@ -127,24 +157,64 @@ def contextualize_er_extraction_prompt(context: str) -> str:
     return general_instructions + "\n" + context_goes_here + "\n" + input_goes_here
 
 
+def file_context(file_path: str, num_lines: int = 5) -> str:
+    """读取文件前几行作为上下文。"""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = []
+            for _ in range(num_lines):
+                line = f.readline()
+                if not line:
+                    break
+                lines.append(line)
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 # ============================================================
-# Entity Schema 构造
+# 四、自定义文本切分器
+# ============================================================
+
+class RegexTextSplitter(TextSplitter):
+    """按正则分隔符切分文本。"""
+
+    def __init__(self, pattern: str = "---"):
+        self.pattern = pattern
+
+    async def run(self, text: str) -> TextChunks:
+        parts = re.split(self.pattern, text)
+        chunks = []
+        for i, p in enumerate(parts):
+            stripped = (p or "").strip()
+            if stripped and len(stripped) > 10:
+                chunks.append(TextChunk(text=stripped, index=i))
+        return TextChunks(chunks=chunks)
+
+
+# ============================================================
+# 五、Schema 构造
 # ============================================================
 
 def build_entity_schema(
     approved_entities: List[str],
     approved_facts: Dict[str, dict],
 ) -> dict:
-    """把批准的实体类型和事实类型转成 SimpleKGPipeline 需要的 schema。"""
+    """把批准的实体类型和事实类型转成 schema dict。"""
     node_types = list(approved_entities)
-    relationship_types = [k.upper() for k in approved_facts.keys()]
+
+    relationship_types = list({
+        f["predicate_label"].upper()
+        for f in approved_facts.values()
+    })
+
     patterns = [
         [
-            fact["subject_label"],
-            fact["predicate_label"].upper(),
-            fact["object_label"],
+            f["subject_label"],
+            f["predicate_label"].upper(),
+            f["object_label"],
         ]
-        for fact in approved_facts.values()
+        for f in approved_facts.values()
     ]
 
     return {
@@ -156,31 +226,7 @@ def build_entity_schema(
 
 
 # ============================================================
-# KG Builder 工厂
-# ============================================================
-
-def make_kg_builder(
-    file_path: str,
-    entity_schema: dict,
-) -> SimpleKGPipeline:
-    """为单个文件构造一个知识图谱构建 Pipeline。"""
-    context = file_context(file_path)
-    prompt = contextualize_er_extraction_prompt(context)
-
-    return SimpleKGPipeline(
-        llm=get_rag_llm(),
-        driver=get_rag_driver(),
-        embedder=get_rag_embedder(),
-        from_pdf=True,
-        pdf_loader=MarkdownDataLoader(),
-        text_splitter=RegexTextSplitter("---"),
-        schema=entity_schema,
-        prompt_template=prompt,
-    )
-
-
-# ============================================================
-# 批量执行
+# 六、主入口
 # ============================================================
 
 async def build_unstructured_graph(
@@ -189,59 +235,163 @@ async def build_unstructured_graph(
     approved_facts: Dict[str, dict],
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """为已批准的所有 Markdown 文件构建非结构化图谱。
+    """使用底层组件从 Markdown 构建非结构化图谱。
 
-    Args:
-        approved_files: 相对 IMPORT_DIR 的文件路径列表
-        approved_entities: 已批准的实体类型
-        approved_facts: 已批准的事实类型
-        progress_cb: 可选回调，每处理完一个文件调用一次
-
-    Returns:
-        {'status': 'success', 'results': {...}}
-        或
-        {'status': 'error', 'error_message': '...'}
+    ★ 关键：
+        - 使用我们自定义的简洁 prompt
+        - use_structured_output=False（兼容 DeepSeek）
     """
     if not approved_entities:
-        return {
-            "status": "error",
-            "error_message": "缺少 approved_entity_types，请先完成 NER 阶段",
-        }
+        return {"status": "error", "error_message": "缺少 approved_entity_types"}
+
     if not approved_facts:
+        return {"status": "error", "error_message": "缺少 approved_fact_types"}
+
+    # 1. Schema
+    schema_dict = build_entity_schema(approved_entities, approved_facts)
+    print(
+        f"[build-unstr] Schema 就绪: "
+        f"{len(schema_dict['node_types'])} 节点, "
+        f"{len(schema_dict['relationship_types'])} 关系"
+    )
+
+    # 2. 组件
+    try:
+        llm = get_rag_llm()
+        driver = get_rag_driver()
+
+        text_splitter = RegexTextSplitter(pattern="---")
+
+        # ★ 构造自定义 prompt（用第一个文件的上下文，作为全局模板）
+        # 由于 ERExtractionTemplate 需要 {schema} 和 {text} 占位符，
+        # 我们先用空 context 生成一个基础模板
+        custom_prompt = contextualize_er_extraction_prompt("")
+
+        # extractor（动态过滤参数）
+        extractor_kwargs = _filter_kwargs(
+            LLMEntityRelationExtractor,
+            llm=llm,
+            on_error=OnError.RAISE if OnError else None,
+            use_structured_output=False,
+            structured_output=False,
+            prompt_template=custom_prompt,       # ★ 传入自定义 prompt
+            create_lexical_graph=False,
+        )
+        extractor_kwargs = {
+            k: v for k, v in extractor_kwargs.items() if v is not None
+        }
+        print(f"[build-unstr] Extractor 参数: {list(extractor_kwargs.keys())}")
+
+        extractor = LLMEntityRelationExtractor(**extractor_kwargs)
+
+        # 兜底：直接设置属性
+        for attr in ("use_structured_output", "structured_output"):
+            if hasattr(extractor, attr):
+                try:
+                    setattr(extractor, attr, False)
+                    print(f"[build-unstr] 强制 {attr}=False")
+                except Exception:
+                    pass
+
+        # writer
+        writer_kwargs = _filter_kwargs(
+            Neo4jWriter,
+            driver=driver,
+            neo4j_database=(
+                getattr(config, "NEO4J_DATABASE", None) or "neo4j"
+            ),
+        )
+        print(f"[build-unstr] Writer 参数: {list(writer_kwargs.keys())}")
+        writer = Neo4jWriter(**writer_kwargs)
+
+    except Exception as e:
+        traceback.print_exc()
         return {
             "status": "error",
-            "error_message": "缺少 approved_fact_types，请先完成事实类型阶段",
+            "error_message": f"初始化组件失败: {e}",
         }
 
-    entity_schema = build_entity_schema(approved_entities, approved_facts)
-
+    # 3. 逐文件处理
     import_dir = Path(config.IMPORT_DIR)
     results = {}
 
     for file_name in approved_files:
-        # 只处理 .md / .txt
-        if not file_name.lower().endswith((".md", ".txt", ".markdown")):
+        if not file_name.lower().endswith((".md", ".markdown", ".txt")):
             continue
 
         file_path = import_dir / file_name
         if not file_path.exists():
-            results[file_name] = {"status": "error", "message": "文件不存在"}
+            results[file_name] = {
+                "status": "error",
+                "error_message": f"文件不存在: {file_path}",
+            }
             continue
 
         if progress_cb:
             progress_cb(file_name)
 
         try:
-            builder = make_kg_builder(str(file_path), entity_schema)
-            result = await builder.run_async(file_path=str(file_path))
+            # a. 读文件
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+
+            # b. 切分
+            chunks = await text_splitter.run(text)
+            if not chunks.chunks:
+                results[file_name] = {
+                    "status": "error",
+                    "error_message": "切分后无有效块",
+                }
+                continue
+
+            # c. 抽取
+            try:
+                graph = await extractor.run(
+                    chunks=chunks, schema=schema_dict
+                )
+            except TypeError:
+                graph = await extractor.run(chunks, schema_dict)
+
+            # d. 写入
+            try:
+                await writer.run(graph)
+            except TypeError:
+                await writer.run(graph=graph)
+
+            # e. 统计
+            nodes_count = 0
+            for attr in ("nodes", "entities"):
+                if hasattr(graph, attr):
+                    try:
+                        nodes_count = len(getattr(graph, attr))
+                        break
+                    except Exception:
+                        pass
+
             results[file_name] = {
                 "status": "success",
-                "result": result.result,
+                "result": {
+                    "resolver": {
+                        "number_of_created_nodes": nodes_count,
+                    }
+                },
             }
+            print(
+                f"[build-unstr] ✓ {file_name} "
+                f"({len(chunks.chunks)} 块, {nodes_count} 节点)"
+            )
+
         except Exception as e:
+            tb = traceback.format_exc()
+            print(f"\n[build-unstr] ✗ {file_name} 失败：")
+            print(tb)
             results[file_name] = {
                 "status": "error",
                 "error_message": str(e),
             }
+
+    # 4. 汇总
+    ok = sum(1 for v in results.values() if v.get("status") == "success")
+    print(f"\n[build-unstr] 完成：{ok}/{len(results)}")
 
     return {"status": "success", "results": results}

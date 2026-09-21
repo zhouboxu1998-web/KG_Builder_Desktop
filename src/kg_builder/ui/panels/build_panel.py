@@ -4,15 +4,16 @@
     - approved_structured_files    已批准的结构化文件（CSV/JSON）
     - approved_unstructured_files  已批准的非结构化文件（MD/TXT）
 
-兼容旧字段：
-    - approved_files               合并版（用于兜底）
-
 命令：
     build        结构化导入（CSV → 领域图）
     build-unstr  非结构化抽取（MD → 主题图）
-    resolve      实体解析（连接领域图和主题图）
+    resolve      实体解析（连接两图）
     clear        清空数据库
     all          依次执行 build → build-unstr → resolve
+
+★ Schema 批准：
+    build 命令要求 schema 已被用户批准。
+    pipeline.is_schema_approved() 返回 True 才能执行。
 """
 
 from kg_builder.tools.kg_build_tools import construct_domain_graph
@@ -49,7 +50,7 @@ UNSTRUCTURED_EXTS = (".md", ".markdown", ".txt", ".pdf")
 # ============================================================
 
 class BuildPanel(BasePanel):
-    title = "⑥ 构建图谱"
+    title = "7.构建图谱"
     subtitle = "导入 CSV / 抽取 Markdown / 实体解析"
 
     def __init__(self, master, bridge, pipeline, **kwargs):
@@ -67,7 +68,6 @@ class BuildPanel(BasePanel):
         )
 
     def on_send(self, text: str, on_chunk=None):
-        # 构建命令是同步的，on_chunk 不用
         return self._handle(text)
 
     # ========================================================
@@ -97,42 +97,37 @@ class BuildPanel(BasePanel):
         return "可用命令: build / build-unstr / resolve / clear / all"
 
     # ========================================================
-    # 辅助：读取分类文件列表（带兜底）
+    # 辅助：读取分类文件列表
     # ========================================================
     async def _get_structured_files(self) -> list:
-        """读取已批准的结构化文件。
-
-        优先读分类 state；若不存在（旧会话），从合并列表里过滤。
-        """
-        files_caller = self.pipeline.session.files_caller
+        files_caller = self.pipeline.session.structured_files_caller
+        if files_caller is None:
+            files_caller = self.pipeline.session.files_caller
         if files_caller is None:
             return []
 
         state = (await files_caller.get_session()).state
 
-        # 优先：分类 state
         files = state.get(APPROVED_STRUCTURED_FILES)
         if files:
             return list(files)
 
-        # 兜底：从合并列表过滤
         merged = state.get(APPROVED_FILES, [])
         return [f for f in merged if f.lower().endswith(STRUCTURED_EXTS)]
 
     async def _get_unstructured_files(self) -> list:
-        """读取已批准的非结构化文件。"""
-        files_caller = self.pipeline.session.files_caller
+        files_caller = self.pipeline.session.unstructured_files_caller
+        if files_caller is None:
+            files_caller = self.pipeline.session.files_caller
         if files_caller is None:
             return []
 
         state = (await files_caller.get_session()).state
 
-        # 优先：分类 state
         files = state.get(APPROVED_UNSTRUCTURED_FILES)
         if files:
             return list(files)
 
-        # 兜底
         merged = state.get(APPROVED_FILES, [])
         return [f for f in merged if f.lower().endswith(UNSTRUCTURED_EXTS)]
 
@@ -156,26 +151,42 @@ class BuildPanel(BasePanel):
     # build（结构化）
     # ========================================================
     async def _build_structured(self) -> str:
-        schema_caller = self.pipeline.session.schema_caller
-        if schema_caller is None:
-            msg = "❌ 请先完成「③ 图谱结构」阶段。"
-            self.add_system_message(msg, "error")
-            return msg
-
-        # 检查是否有结构化文件被批准
-        structured = await self._get_structured_files()
-        if not structured:
-            msg = "❌ 没有已批准的结构化文件（CSV/JSON），请回到「② 选择文件」重新批准。"
+        # 1. 检查 Schema 是否已批准
+        if not self.pipeline.is_schema_approved():
+            msg = (
+                "❌ 构建计划尚未批准。\n"
+                "   请回到「③ 图谱结构」面板，"
+                "输入「批准」后再执行。"
+            )
             self.add_system_message(msg, "warning")
             return msg
 
-        session = await schema_caller.get_session()
-        plan = session.state.get(APPROVED_CONSTRUCTION_PLAN) or \
-               session.state.get(PROPOSED_CONSTRUCTION_PLAN)
+        # 2. 优先从 pipeline 拿已批准的计划
+        plan = self.pipeline.get_schema_plan()
+
+        # 3. 兜底：从 schema caller 的 state 读
+        if not plan:
+            schema_caller = self.pipeline.session.schema_caller
+            if schema_caller is not None:
+                session = await schema_caller.get_session()
+                plan = (
+                    session.state.get(APPROVED_CONSTRUCTION_PLAN)
+                    or session.state.get(PROPOSED_CONSTRUCTION_PLAN)
+                )
 
         if not plan:
             msg = "❌ 没有可用的构建计划，请回到「③ 图谱结构」。"
             self.add_system_message(msg, "error")
+            return msg
+
+        # 4. 检查是否有结构化文件被批准
+        structured = await self._get_structured_files()
+        if not structured:
+            msg = (
+                "❌ 没有已批准的结构化文件（CSV/JSON）。\n"
+                "   请回到「② 选择文件」重新批准。"
+            )
+            self.add_system_message(msg, "warning")
             return msg
 
         self.add_system_message(
@@ -198,30 +209,28 @@ class BuildPanel(BasePanel):
     async def _build_unstructured(self) -> str:
         fact_caller = self.pipeline.session.fact_caller
         if fact_caller is None:
-            msg = "❌ 请先完成「④ 实体识别」和「⑤ 事实类型」阶段。"
+            msg = "❌ 请先完成「⑤ 实体识别」和「⑥ 事实类型」阶段。"
             self.add_system_message(msg, "error")
             return msg
 
-        # 从 fact 阶段拿已批准的实体和事实
         fact_state = (await fact_caller.get_session()).state
         approved_entities = fact_state.get(APPROVED_ENTITIES, [])
         approved_facts = fact_state.get(APPROVED_FACTS, {})
 
         if not approved_entities:
-            msg = "❌ 没有已批准的实体类型，请先完成「④ 实体识别」。"
+            msg = "❌ 没有已批准的实体类型，请先完成「⑤ 实体识别」。"
             self.add_system_message(msg, "warning")
             return msg
         if not approved_facts:
-            msg = "❌ 没有已批准的事实类型，请先完成「⑤ 事实类型」。"
+            msg = "❌ 没有已批准的事实类型，请先完成「⑥ 事实类型」。"
             self.add_system_message(msg, "warning")
             return msg
 
-        # 从分类 state 拿非结构化文件
         md_files = await self._get_unstructured_files()
         if not md_files:
             msg = (
                 "❌ 没有已批准的非结构化文件（Markdown/TXT）。\n"
-                "   请回到「② 选择文件」批准 .md 文件。"
+                "   请回到「④ 选择文件」批准 .md 文件。"
             )
             self.add_system_message(msg, "warning")
             return msg
@@ -253,7 +262,6 @@ class BuildPanel(BasePanel):
             self.add_system_message(msg, "error")
             return msg
 
-        # 统计
         results = result.get("results", {})
         ok = sum(1 for v in results.values() if v.get("status") == "success")
         fail = len(results) - ok
@@ -264,13 +272,14 @@ class BuildPanel(BasePanel):
             "success",
         )
 
-        # 显示每个文件的统计
         for fname, v in results.items():
             if v.get("status") == "success":
                 r = v.get("result", {})
                 resolver = r.get("resolver", {}) if isinstance(r, dict) else {}
                 n = resolver.get("number_of_created_nodes", "?")
-                self.add_system_message(f"  · {fname}: 创建 {n} 个节点", "info")
+                self.add_system_message(
+                    f"  · {fname}: 创建 {n} 个节点", "info"
+                )
             else:
                 self.add_system_message(
                     f"  · {fname}: ❌ {v.get('error_message', '未知错误')}",
@@ -312,7 +321,6 @@ class BuildPanel(BasePanel):
                 "info",
             )
 
-        # 显示未匹配的
         unmatched = [r for r in results if not r.get("matched")]
         if unmatched:
             names = [r["label"] for r in unmatched]
