@@ -1,19 +1,21 @@
-# 核心
+# ---------- Google ADK ----------
 google-adk>=0.3.0
 google-genai>=0.3.0
+
+# ---------- LLM 接口 ----------
 litellm>=1.40.0
-python-dotenv>=1.0.0
 
-# 图数据库
+# ---------- 图数据库 ----------
 neo4j>=5.20.0
-neo4j-graphrag>=0.5.0
+neo4j-graphrag>=1.19.0
 
-# 工具
+# ---------- 工具 ----------
+python-dotenv>=1.0.0
 rapidfuzz>=3.9.0
 
-# 桌面 UI
+# ---------- 桌面 UI ----------
 customtkinter>=5.2.0
 Pillow>=10.0.0
 
-# 异步
+# ---------- 异步 ----------
 nest-asyncio>=1.6.0

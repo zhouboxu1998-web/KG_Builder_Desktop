@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kg-builder"
+version = "0.1.0"
+description = "基于 Google ADK 的多 Agent 知识图谱构建系统"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "google-adk>=0.3.0",
+    "google-genai>=0.3.0",
+    "litellm>=1.40.0",
+    "neo4j>=5.20.0",
+    "neo4j-graphrag>=1.19.0",
+    "python-dotenv>=1.0.0",
+    "rapidfuzz>=3.9.0",
+    "customtkinter>=5.2.0",
+    "Pillow>=10.0.0",
+    "nest-asyncio>=1.6.0",
+]
+
+[project.scripts]
+kg-builder = "kg_builder.ui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"kg_builder" = ["prompts/*.md"]
