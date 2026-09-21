@@ -1,14 +1,14 @@
 """ADK 知识图谱构建器 - 顶层工作流编排（8 阶段版）。
 
 阶段：
-    ① UserIntent              用户描述想要的图谱
-    ② StructuredFiles         选择结构化文件（CSV）
-    ③ SchemaLoop              提议 Schema → 审查 → 循环 → 用户批准
-    ④ UnstructuredFiles       选择非结构化文件（MD）
-    ⑤ NER                     从非结构化文本提议实体类型
-    ⑥ Fact                    基于实体，提议事实类型
-    ⑦ Build                   （由 build_panel 控制）
-    ⑧ Query                   （由 query_panel 控制）
+    1 UserIntent              用户描述想要的图谱
+    2 StructuredFiles         选择结构化文件（CSV）
+    3 SchemaLoop              提议 Schema → 审查 → 循环 → 用户批准
+    4 UnstructuredFiles       选择非结构化文件（MD）
+    5 NER                     从非结构化文本提议实体类型
+    6 Fact                    基于实体，提议事实类型
+    7 Build                   （由 build_panel 控制）
+    8 Query                   （由 query_panel 控制）
 
 关键设计：
     Schema 阶段跑完 LoopAgent 后，需要用户在 UI 里输入「批准」
@@ -147,10 +147,10 @@ class KGBuilderPipeline:
         return dict(session.state)
 
     # --------------------------------------------------------
-    # 阶段 ① 用户意图
+    # 阶段 1 用户意图
     # --------------------------------------------------------
     async def start_intent(self) -> AgentCaller:
-        print("[Pipeline] 启动阶段 ①：用户意图")
+        print("[Pipeline] 启动阶段 1：用户意图")
         agent = build_user_intent_agent()
         self.session.intent_caller = await make_agent_caller(agent)
         return self.session.intent_caller
@@ -161,10 +161,10 @@ class KGBuilderPipeline:
             self.session.stage_states["intent"] = dict(s.state)
 
     # --------------------------------------------------------
-    # 阶段 ② 结构化文件选择
+    # 阶段 2 结构化文件选择
     # --------------------------------------------------------
     async def start_structured_selection(self) -> AgentCaller:
-        print("[Pipeline] 启动阶段 ②：结构化文件选择")
+        print("[Pipeline] 启动阶段 2：结构化文件选择")
 
         state = await self._inherit_state(
             self.session.intent_caller, "结构化文件选择"
@@ -188,10 +188,10 @@ class KGBuilderPipeline:
             self.session.stage_states["structured_files"] = dict(s.state)
 
     # --------------------------------------------------------
-    # 阶段 ③ Schema 提议 / 审查循环
+    # 阶段 3 Schema 提议 / 审查循环
     # --------------------------------------------------------
     async def start_schema_proposal(self) -> AgentCaller:
-        print("[Pipeline] 启动阶段 ③：Schema 提议/审查循环")
+        print("[Pipeline] 启动阶段 3：Schema 提议/审查循环")
 
         state = await self._inherit_state(
             self.session.structured_files_caller, "Schema 提议"
@@ -272,10 +272,10 @@ class KGBuilderPipeline:
         self._approved_schema_plan = None
 
     # --------------------------------------------------------
-    # 阶段 ④ 非结构化文件选择
+    # 阶段 4 非结构化文件选择
     # --------------------------------------------------------
     async def start_unstructured_selection(self) -> AgentCaller:
-        print("[Pipeline] 启动阶段 ④：非结构化文件选择")
+        print("[Pipeline] 启动阶段 4：非结构化文件选择")
 
         base = await self._inherit_state(
             self.session.intent_caller, "非结构化文件选择"
@@ -307,10 +307,10 @@ class KGBuilderPipeline:
             self.session.stage_states["unstructured_files"] = dict(s.state)
 
     # --------------------------------------------------------
-    # 阶段 ⑤ NER
+    # 阶段 5 NER
     # --------------------------------------------------------
     async def start_ner(self) -> AgentCaller:
-        print("[Pipeline] 启动阶段 ⑤：NER")
+        print("[Pipeline] 启动阶段 5：NER")
 
         prev = self.session.unstructured_files_caller
         if prev is None:
@@ -341,10 +341,10 @@ class KGBuilderPipeline:
             self.session.stage_states["ner"] = dict(s.state)
 
     # --------------------------------------------------------
-    # 阶段 ⑥ 事实类型
+    # 阶段 6 事实类型
     # --------------------------------------------------------
     async def start_fact(self) -> AgentCaller:
-        print("[Pipeline] 启动阶段 ⑥：事实类型")
+        print("[Pipeline] 启动阶段 6：事实类型")
 
         state = await self._inherit_state(self.session.ner_caller, "事实类型")
         state.setdefault(APPROVED_USER_GOAL, {})
