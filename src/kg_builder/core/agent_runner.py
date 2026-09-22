@@ -1,7 +1,17 @@
-"""封装 Google ADK 的 Runner / Session。
+"""
+封装 Google ADK 的 Runner / Session。
+
+本模块同时负责：
+
+    1. ADK AgentCaller
+    2. Session 创建
+    3. ADK Event 解析
+    4. Runtime 可观测性
+    5. Reasoning 泄漏过滤
 
 Reasoning 泄漏过滤（保守版）：
-    只在**开头明确是推理句式**时才切。
+    只在开头明确是推理句式时才切。
+
     特征：
         - "The user ..."
         - "I should ..."
@@ -9,12 +19,15 @@ Reasoning 泄漏过滤（保守版）：
         - "First, I ..."
         - "Okay, ..." / "Hmm, ..." / "Wait, ..."
 
-    切到**第一个空行**就停。
+    切到第一个空行就停。
     遇到中文立即停。
-    其他情况原样返回（宁可留泄漏，也不误删内容）。
+    其他情况原样返回。
 """
 
+from __future__ import annotations
+
 import re
+import time
 from typing import Any, Callable, Dict, Optional
 
 from google.adk.agents import Agent
@@ -22,20 +35,53 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
+from kg_builder.core.runtime import (
+    AgentRuntime,
+    default_runtime,
+)
+
 
 # ============================================================
-# 明确推理句式（大小写不敏感）
+# 明确推理句式
 # ============================================================
+
 _REASONING_PATTERNS = [
-    re.compile(r"^The user\s+(?:just|is|said|wants|asks|has)", re.IGNORECASE),
-    re.compile(r"^I\s+(?:should|need|will|must|can|am going to|have to)", re.IGNORECASE),
-    re.compile(r"^Let me\s+", re.IGNORECASE),
-    re.compile(r"^First,\s+I\s+", re.IGNORECASE),
-    re.compile(r"^Okay,\s+(?:I|let)", re.IGNORECASE),
-    re.compile(r"^Hmm,\s+", re.IGNORECASE),
-    re.compile(r"^Wait,\s+", re.IGNORECASE),
-    re.compile(r"^Alright,\s+(?:I|let)", re.IGNORECASE),
-    re.compile(r"^Now,\s+I\s+", re.IGNORECASE),
+    re.compile(
+        r"^The user\s+(?:just|is|said|wants|asks|has)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^I\s+(?:should|need|will|must|can|am going to|have to)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^Let me\s+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^First,\s+I\s+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^Okay,\s+(?:I|let)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^Hmm,\s+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^Wait,\s+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^Alright,\s+(?:I|let)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^Now,\s+I\s+",
+        re.IGNORECASE,
+    ),
 ]
 
 
@@ -43,60 +89,96 @@ def _looks_like_reasoning(text: str) -> bool:
     """判断文本开头是否像推理。"""
     if not text:
         return False
-    first_line = text.split("\n", 1)[0].strip()
-    for pat in _REASONING_PATTERNS:
-        if pat.match(first_line):
+
+    first_line = text.split(
+        "\n",
+        1,
+    )[0].strip()
+
+    for pattern in _REASONING_PATTERNS:
+        if pattern.match(first_line):
             return True
+
     return False
 
 
 def _strip_reasoning(text: str) -> str:
-    """剥离 LLM 推理泄漏（保守版）。
+    """
+    剥离 LLM reasoning 泄漏。
 
-    只在**开头明确是推理句式**时切，遇到第一个空行就停。
-    其他情况**原样返回**。
+    这是一个保守实现：
+
+        如果不像 reasoning：
+            原样返回
+
+        如果像 reasoning：
+            尝试寻找正式回答的起点
+
+    宁可少过滤，也不要误删正常回答。
     """
     if not text:
         return text
 
     stripped = text.lstrip()
 
-    # 不以推理句式开头 → 原样返回
     if not _looks_like_reasoning(stripped):
         return text
 
-    # 找第一个空行（\n\n）作为切分点
     lines = stripped.split("\n")
 
     for i, line in enumerate(lines):
         s = line.strip()
 
-        # 遇到空行 → 认为是段落分隔
+        # 空行通常意味着 reasoning 与正式回答之间的段落分隔。
         if not s:
-            rest = "\n".join(lines[i + 1:]).strip()
+            rest = "\n".join(
+                lines[i + 1:]
+            ).strip()
+
             if rest:
                 return rest
+
             break
 
-        # 遇到中文 → 认为正式内容开始
-        if any("\u4e00" <= ch <= "\u9fff" for ch in s):
-            rest = "\n".join(lines[i:]).strip()
+        # 中文内容通常已经进入正式回答。
+        if any(
+            "\u4e00" <= ch <= "\u9fff"
+            for ch in s
+        ):
+            rest = "\n".join(
+                lines[i:]
+            ).strip()
+
             if rest:
                 return rest
+
             break
 
-        # 遇到 markdown 结构 → 认为正式内容开始
-        if s.startswith(("#", "- ", "* ", "|", "```", "1. ", "2. ")):
-            rest = "\n".join(lines[i:]).strip()
+        # Markdown 结构通常意味着正式输出开始。
+        if s.startswith(
+            (
+                "#",
+                "- ",
+                "* ",
+                "|",
+                "```",
+                "1. ",
+                "2. ",
+            )
+        ):
+            rest = "\n".join(
+                lines[i:]
+            ).strip()
+
             if rest:
                 return rest
+
             break
 
-        # 只检查前 5 行（超过就不是纯推理了）
+        # 最多检查前 5 行。
         if i >= 5:
             return text
 
-    # 兜底：没找到切分点 → 原样返回（宁可留泄漏）
     return text
 
 
@@ -105,7 +187,23 @@ def _strip_reasoning(text: str) -> str:
 # ============================================================
 
 class AgentCaller:
-    """一个 Agent + 一个会话的轻量封装。"""
+    """
+    一个 Agent + 一个 ADK Session 的轻量封装。
+
+    Phase 1 新增：
+
+        - runtime
+        - run_id
+        - execution timing
+        - ADK Event tracking
+        - error tracking
+
+    原有调用方式保持兼容：
+
+        caller = await make_agent_caller(agent)
+
+        response = await caller.chat("...")
+    """
 
     def __init__(
         self,
@@ -115,13 +213,32 @@ class AgentCaller:
         session_id: str,
         session_service: InMemorySessionService,
         app_name: str,
+        runtime: Optional[AgentRuntime] = None,
+        run_id: Optional[str] = None,
+        stage: Optional[str] = None,
     ):
         self.agent = agent
         self.runner = runner
+
         self.user_id = user_id
         self.session_id = session_id
         self.session_service = session_service
         self.app_name = app_name
+
+        # Runtime
+        self.runtime = runtime or default_runtime
+
+        # 如果外部没有指定，则每个 Caller 自己创建一个 Run。
+        self.run_id = run_id or self.runtime.start_run(
+            agent_name=self.agent.name,
+            stage=stage,
+        )
+
+        self.stage = stage
+
+    # ========================================================
+    # Chat
+    # ========================================================
 
     async def chat(
         self,
@@ -129,67 +246,245 @@ class AgentCaller:
         verbose: bool = False,
         on_chunk: Optional[Callable[[str], None]] = None,
     ) -> str:
+        """
+        向 Agent 发送一条消息。
+
+        Runtime 会记录：
+
+            agent_started
+                ↓
+            adk_event
+                ↓
+            adk_event
+                ↓
+            agent_finished
+
+        如果出现异常：
+
+            agent_error
+        """
+
         message = types.Content(
-            role="user", parts=[types.Part(text=user_input)]
+            role="user",
+            parts=[
+                types.Part(
+                    text=user_input
+                )
+            ],
         )
 
         final_text = ""
 
-        async for event in self.runner.run_async(
-            user_id=self.user_id,
-            session_id=self.session_id,
-            new_message=message,
-        ):
-            if verbose:
-                print(
-                    f"[Event] author={event.author} "
-                    f"final={event.is_final_response()} "
-                    f"partial={getattr(event, 'partial', False)}"
-                )
+        start_time = time.perf_counter()
 
-            text = ""
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    t = getattr(part, "text", None)
-                    if t:
-                        text += t
+        self.runtime.agent_started(
+            run_id=self.run_id,
+            agent_name=self.agent.name,
+            stage=self.stage,
+        )
 
-            if text:
-                is_partial = bool(getattr(event, "partial", False))
-
-                if is_partial and on_chunk:
-                    on_chunk(text)
-
-                if event.is_final_response():
-                    final_text = text
-                elif is_partial:
-                    final_text += text
-
-            if getattr(event, "actions", None) and getattr(
-                event.actions, "escalate", False
+        try:
+            async for event in self.runner.run_async(
+                user_id=self.user_id,
+                session_id=self.session_id,
+                new_message=message,
             ):
-                break
+                # ------------------------------------------------
+                # Runtime Event
+                # ------------------------------------------------
 
-        # 过滤 reasoning 泄漏
-        cleaned = _strip_reasoning(final_text)
-
-        if verbose:
-            if cleaned != final_text:
-                print(
-                    f"[AgentCaller] 剥离 reasoning："
-                    f"{len(final_text)} → {len(cleaned)} 字符"
+                self.runtime.adk_event(
+                    run_id=self.run_id,
+                    event=event,
+                    agent_name=self.agent.name,
+                    stage=self.stage,
                 )
-            else:
-                print(f"[AgentCaller] 无 reasoning 需要剥离")
 
-        return cleaned
+                if verbose:
+                    print(
+                        f"[Event] "
+                        f"run={self.run_id} "
+                        f"author={event.author} "
+                        f"final={event.is_final_response()} "
+                        f"partial={getattr(event, 'partial', False)}"
+                    )
+
+                # ------------------------------------------------
+                # 提取文本
+                # ------------------------------------------------
+
+                text = ""
+
+                if event.content and event.content.parts:
+                    for part in event.content.parts:
+                        t = getattr(
+                            part,
+                            "text",
+                            None,
+                        )
+
+                        if t:
+                            text += t
+
+                if text:
+                    is_partial = bool(
+                        getattr(
+                            event,
+                            "partial",
+                            False,
+                        )
+                    )
+
+                    # Streaming
+                    if is_partial and on_chunk:
+                        on_chunk(text)
+
+                    # 最终响应
+                    if event.is_final_response():
+                        final_text = text
+
+                    # Partial response
+                    elif is_partial:
+                        final_text += text
+
+                # ------------------------------------------------
+                # ADK escalate
+                # ------------------------------------------------
+
+                actions = getattr(
+                    event,
+                    "actions",
+                    None,
+                )
+
+                if (
+                    actions
+                    and getattr(
+                        actions,
+                        "escalate",
+                        False,
+                    )
+                ):
+                    break
+
+            # ----------------------------------------------------
+            # Reasoning 过滤
+            # ----------------------------------------------------
+
+            cleaned = _strip_reasoning(
+                final_text
+            )
+
+            elapsed_ms = (
+                time.perf_counter()
+                - start_time
+            ) * 1000
+
+            self.runtime.agent_finished(
+                run_id=self.run_id,
+                agent_name=self.agent.name,
+                duration_ms=elapsed_ms,
+                stage=self.stage,
+            )
+
+            if verbose:
+                if cleaned != final_text:
+                    print(
+                        "[AgentCaller] "
+                        f"剥离 reasoning："
+                        f"{len(final_text)} → "
+                        f"{len(cleaned)} 字符"
+                    )
+                else:
+                    print(
+                        "[AgentCaller] "
+                        "无 reasoning 需要剥离"
+                    )
+
+                print(
+                    "[AgentCaller] "
+                    f"duration={elapsed_ms:.2f}ms"
+                )
+
+            return cleaned
+
+        except Exception as exc:
+            elapsed_ms = (
+                time.perf_counter()
+                - start_time
+            ) * 1000
+
+            self.runtime.agent_error(
+                run_id=self.run_id,
+                agent_name=self.agent.name,
+                error=exc,
+                duration_ms=elapsed_ms,
+                stage=self.stage,
+            )
+
+            raise
+
+    # ========================================================
+    # Session
+    # ========================================================
 
     async def get_session(self):
+        """获取当前 ADK Session。"""
         return await self.runner.session_service.get_session(
             app_name=self.runner.app_name,
             user_id=self.user_id,
             session_id=self.session_id,
         )
+
+    # ========================================================
+    # Runtime
+    # ========================================================
+
+    def get_runtime_events(self):
+        """获取当前 Agent Caller 的全部 Runtime Events。"""
+        return self.runtime.get_run_events(
+            self.run_id
+        )
+
+    def get_run_summary(self) -> Dict[str, Any]:
+        """
+        返回当前 Run 的简单统计。
+
+        这个接口后面会直接用于 UI。
+        """
+
+        events = self.get_runtime_events()
+
+        errors = [
+            event
+            for event in events
+            if event.event_type == "agent_error"
+        ]
+
+        finished = [
+            event
+            for event in events
+            if event.event_type == "agent_finished"
+        ]
+
+        duration_ms = None
+
+        if finished:
+            duration_ms = finished[-1].duration_ms
+
+        return {
+            "run_id": self.run_id,
+            "agent": self.agent.name,
+            "stage": self.stage,
+            "event_count": len(events),
+            "error_count": len(errors),
+            "duration_ms": duration_ms,
+            "status": (
+                "error"
+                if errors
+                else "success"
+            ),
+        }
 
 
 # ============================================================
@@ -200,19 +495,59 @@ async def make_agent_caller(
     agent: Agent,
     app_name: Optional[str] = None,
     initial_state: Optional[Dict[str, Any]] = None,
+    runtime: Optional[AgentRuntime] = None,
+    run_id: Optional[str] = None,
+    stage: Optional[str] = None,
 ) -> AgentCaller:
-    app_name = app_name or f"{agent.name}_app"
-    user_id = f"{agent.name}_user"
-    session_id = f"{agent.name}_session"
+    """
+    创建 AgentCaller。
+
+    新增参数：
+
+        runtime:
+            指定 Runtime。
+
+        run_id:
+            允许多个 Agent 共享同一个 Run ID。
+
+        stage:
+            标识当前 Agent 所属 Pipeline 阶段。
+
+    旧代码：
+
+        await make_agent_caller(agent)
+
+    仍然完全兼容。
+    """
+
+    app_name = (
+        app_name
+        or f"{agent.name}_app"
+    )
+
+    user_id = (
+        f"{agent.name}_user"
+    )
+
+    session_id = (
+        f"{agent.name}_session"
+    )
 
     service = InMemorySessionService()
+
     await service.create_session(
         app_name=app_name,
         user_id=user_id,
         session_id=session_id,
         state=initial_state or {},
     )
-    runner = Runner(app_name=app_name, agent=agent, session_service=service)
+
+    runner = Runner(
+        app_name=app_name,
+        agent=agent,
+        session_service=service,
+    )
+
     return AgentCaller(
         agent=agent,
         runner=runner,
@@ -220,4 +555,7 @@ async def make_agent_caller(
         session_id=session_id,
         session_service=service,
         app_name=app_name,
+        runtime=runtime,
+        run_id=run_id,
+        stage=stage,
     )
