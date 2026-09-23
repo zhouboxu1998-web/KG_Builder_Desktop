@@ -168,5 +168,30 @@ class Neo4jClient:
         r = self.send_query("RETURN 1 AS ok")
         return r.get("status") == "success"
 
+    def check_connection(self) -> Dict[str, Any]:
+        """供 UI 健康检查使用。
+
+        与 ping() 不同，本方法返回 app.py 期望的字典格式：
+
+            {"connected": True}
+            {"connected": False, "error_code": ..., "error_message": ...}
+        """
+        result = self.send_query("RETURN 1 AS ok")
+
+        if result.get("status") == "success":
+            return {"connected": True}
+
+        return {
+            "connected": False,
+            "error_code": result.get(
+                "error_code",
+                "NEO4J_ERROR",
+            ),
+            "error_message": result.get(
+                "error_message",
+                "Neo4j 连接失败。",
+            ),
+        }
+
 
 graphdb = Neo4jClient()

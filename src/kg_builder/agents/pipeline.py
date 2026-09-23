@@ -307,6 +307,28 @@ class KGBuilderPipeline:
     # 内部工具
     # ========================================================
 
+    def _ensure_run(
+        self,
+        entrypoint: str = "ui",
+    ) -> None:
+        """
+        确保 PipelineRuntime 处于 running 状态。
+
+        如果 Pipeline 尚未启动，则自动启动一次 Run。
+
+        从 UI 直接进入任意阶段时，必须调用本方法，
+        否则 start_stage() 会抛出：
+
+            PipelineRuntime 当前不是 running 状态：idle
+        """
+
+        if self.runtime.status != "running":
+            self.start_run(
+                metadata={
+                    "entrypoint": entrypoint,
+                }
+            )
+
     async def _inherit_state(
         self,
         prev_caller: Optional[AgentCaller],
@@ -441,6 +463,8 @@ class KGBuilderPipeline:
             "启动阶段 1：用户意图"
         )
 
+        self._ensure_run(entrypoint="intent")
+
         self.runtime.start_stage(
             "intent",
             agent_name="user_intent",
@@ -501,6 +525,8 @@ class KGBuilderPipeline:
             "[Pipeline] "
             "启动阶段 2：结构化文件选择"
         )
+
+        self._ensure_run(entrypoint="structured")
 
         self.runtime.start_stage(
             "structured_files",
@@ -584,6 +610,8 @@ class KGBuilderPipeline:
             "[Pipeline] "
             "启动阶段 3：Schema 提议/审查循环"
         )
+
+        self._ensure_run(entrypoint="schema")
 
         self.runtime.start_stage(
             "schema",
@@ -901,6 +929,8 @@ class KGBuilderPipeline:
             "启动阶段 4：非结构化文件选择"
         )
 
+        self._ensure_run(entrypoint="unstructured")
+
         self.runtime.start_stage(
             "unstructured_files",
             agent_name="unstructured_file_agent",
@@ -1002,6 +1032,8 @@ class KGBuilderPipeline:
             "[Pipeline] "
             "启动阶段 5：NER"
         )
+
+        self._ensure_run(entrypoint="ner")
 
         self.runtime.start_stage(
             "ner",
@@ -1109,6 +1141,8 @@ class KGBuilderPipeline:
             "[Pipeline] "
             "启动阶段 6：事实类型"
         )
+
+        self._ensure_run(entrypoint="fact")
 
         self.runtime.start_stage(
             "fact",
