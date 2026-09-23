@@ -25,22 +25,24 @@ APPROVED_FACTS = "approved_fact_types"
 
 FEEDBACK = "feedback"
 
-# ============================================================
-# Phase 3：Schema Engine
-# ============================================================
-
 SCHEMA_NORMALIZED_PLAN = "schema_normalized_plan"
 SCHEMA_VALIDATION = "schema_validation"
 SCHEMA_VALIDATION_FEEDBACK = "schema_validation_feedback"
 SCHEMA_APPROVED_PLAN = "schema_approved_plan"
 SCHEMA_STATUS = "schema_status"
 
-# ============================================================
-# Phase 4：Ingestion Engine
-# ============================================================
-
 INGESTION_STATUS = "ingestion_status"
 INGESTION_REPORT = "ingestion_report"
 INGESTION_ERRORS = "ingestion_errors"
 INGESTION_WARNINGS = "ingestion_warnings"
 INGESTION_STATS = "ingestion_stats"
+
+QUERY_STATUS = "query_status"
+QUERY_CYPHER = "query_cypher"
+QUERY_PARAMETERS = "query_parameters"
+QUERY_RESULT = "query_result"
+QUERY_RESULT_COUNT = "query_result_count"
+QUERY_ERROR = "query_error"
+QUERY_REPORT = "query_report"
+QUERY_SCHEMA = "query_schema"
+QUERY_ENTITY_CANDIDATES = "query_entity_candidates"

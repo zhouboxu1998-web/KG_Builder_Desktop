@@ -22,12 +22,18 @@ KG Builder Agent Runtime。
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from google.adk.agents import Agent
 from google.adk.events import Event
+
+from kg_builder.core.errors import KGBuilderError
+
+from kg_builder.core.logger import (
+    get_logger,
+    log_runtime_event,
+)
 
 from kg_builder.core.events import (
     CompositeEventListener,
@@ -38,7 +44,7 @@ from kg_builder.core.events import (
 )
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class AgentRuntime:
@@ -95,6 +101,9 @@ class AgentRuntime:
         Listener 出错不会影响主流程。
         """
         self.event_store.append(event)
+
+        # Phase 1-B：Runtime Event 自动进入统一日志系统。
+        log_runtime_event(event)
 
         try:
             self.listeners.on_event(event)
@@ -217,6 +226,18 @@ class AgentRuntime:
         stage: Optional[str] = None,
     ) -> None:
         """记录 Agent 执行异常。"""
+        metadata: Dict[str, Any] = {
+            "exception_type": type(error).__name__,
+        }
+
+        if isinstance(error, KGBuilderError):
+            metadata.update(
+                {
+                    "error_code": error.code,
+                    "error_details": dict(error.details),
+                }
+            )
+
         self.emit(
             RuntimeEvent(
                 event_type="agent_error",
@@ -226,9 +247,7 @@ class AgentRuntime:
                 status="error",
                 duration_ms=duration_ms,
                 message=str(error),
-                metadata={
-                    "exception_type": type(error).__name__,
-                },
+                metadata=metadata,
             )
         )
 

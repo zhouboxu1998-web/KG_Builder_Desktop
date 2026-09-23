@@ -30,7 +30,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from kg_builder.core.errors import IngestionError
 from kg_builder.core.neo4j_client import graphdb
+from kg_builder.core.logger import logged_operation
 
 
 class IngestionEngine:
@@ -194,7 +196,7 @@ class IngestionEngine:
             header = next(reader, None)
 
         if not header:
-            raise ValueError(
+            raise IngestionError(
                 f"CSV 文件为空或没有表头：{source_file}"
             )
 
@@ -866,6 +868,7 @@ class IngestionEngine:
     # Full Ingestion
     # ========================================================
 
+    @logged_operation("ingestion.ingest")
     def ingest(
         self,
         plan: Optional[dict],

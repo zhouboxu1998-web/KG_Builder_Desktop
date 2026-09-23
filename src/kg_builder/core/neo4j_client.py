@@ -6,14 +6,41 @@ from neo4j import GraphDatabase, Record, Result
 from neo4j.graph import Node, Path, Relationship
 
 from kg_builder import config
+from kg_builder.core.errors import (
+    KGBuilderError,
+    Neo4jConnectionError,
+    Neo4jQueryError,
+)
+from kg_builder.core.logger import logged_operation, get_logger, query_fingerprint
+
+logger = get_logger(__name__)
 
 
 def tool_success(key: str, result: Any) -> Dict[str, Any]:
     return {"status": "success", key: result}
 
 
-def tool_error(message: str) -> Dict[str, Any]:
-    return {"status": "error", "error_message": message}
+def tool_error(
+    message: str,
+    error: Optional[KGBuilderError] = None,
+) -> Dict[str, Any]:
+    """构造兼容旧接口的结构化 Neo4j 错误。"""
+
+    payload: Dict[str, Any] = {
+        "status": "error",
+        "error_message": message,
+    }
+
+    if error is not None:
+        payload.update(
+            {
+                "error_code": error.code,
+                "error_type": error.__class__.__name__,
+                "error_details": dict(error.details),
+            }
+        )
+
+    return payload
 
 
 def _to_python(value: Any) -> Any:
@@ -55,20 +82,19 @@ class Neo4jClient:
     _driver = None
 
     def __init__(self):
-        self.database = (
-            config.__dict__.get("NEO4J_DATABASE")
-            or __import__("os").getenv("NEO4J_DATABASE")
-            or __import__("os").getenv("NEO4J_USERNAME")
-            or "neo4j"
-        )
+        self.database = config.NEO4J_DATABASE
 
     def _ensure_driver(self):
         if self._driver is None:
-            import os
             self._driver = GraphDatabase.driver(
-                os.getenv("NEO4J_URI"),
-                auth=(os.getenv("NEO4J_USERNAME", "neo4j"),
-                      os.getenv("NEO4J_PASSWORD")),
+                config.NEO4J_URI,
+                auth=(
+                    config.NEO4J_USERNAME,
+                    config.NEO4J_PASSWORD,
+                ),
+                connection_timeout=(
+                    config.NEO4J_CONNECTION_TIMEOUT_SECONDS
+                ),
             )
         return self._driver
 
@@ -80,10 +106,44 @@ class Neo4jClient:
             self._driver.close()
             self._driver = None
 
+    @logged_operation("neo4j.send_query")
     def send_query(
         self, cypher: str, parameters: Optional[dict] = None
     ) -> Dict[str, Any]:
-        session = self._ensure_driver().session()
+        logger.debug(
+            "Neo4j query requested",
+            extra={
+                "query_fingerprint": query_fingerprint(cypher),
+                "structured": {
+                    "parameter_keys": list((parameters or {}).keys()),
+                },
+            },
+        )
+
+        try:
+            driver = self._ensure_driver()
+        except Exception as error:
+            wrapped = Neo4jConnectionError.from_exception(
+                error,
+                message="Neo4j Driver 初始化失败。",
+            )
+            return tool_error(
+                str(wrapped),
+                wrapped,
+            )
+
+        try:
+            session = driver.session()
+        except Exception as error:
+            wrapped = Neo4jConnectionError.from_exception(
+                error,
+                message="Neo4j Session 创建失败。",
+            )
+            return tool_error(
+                str(wrapped),
+                wrapped,
+            )
+
         try:
             result: Result = session.run(
                 cypher, parameters or {}, database_=self.database
@@ -91,8 +151,16 @@ class Neo4jClient:
             eager = result.to_eager_result()
             records = [_to_python(r.data()) for r in eager.records]
             return tool_success("query_result", records)
-        except Exception as e:
-            return tool_error(str(e))
+        except Exception as error:
+            wrapped = Neo4jQueryError.from_exception(
+                error,
+                message="Neo4j Cypher 执行失败。",
+                details={"query": cypher},
+            )
+            return tool_error(
+                str(wrapped),
+                wrapped,
+            )
         finally:
             session.close()
 

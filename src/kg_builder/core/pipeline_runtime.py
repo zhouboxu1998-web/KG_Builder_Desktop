@@ -51,7 +51,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from kg_builder.core.events import RuntimeEvent
+from kg_builder.core.errors import PipelineError
 from kg_builder.core.runtime import AgentRuntime, default_runtime
+from kg_builder.core.logger import logged_operation
 
 
 # ============================================================
@@ -96,6 +98,7 @@ class StageRecord:
         default_factory=dict
     )
 
+    @logged_operation("pipeline_runtime.start")
     def start(
         self,
         agent_name: Optional[str] = None,
@@ -120,6 +123,7 @@ class StageRecord:
         if metadata:
             self.metadata.update(metadata)
 
+    @logged_operation("pipeline_runtime.finish")
     def finish(
         self,
         status: str = "success",
@@ -297,7 +301,7 @@ class PipelineRuntime:
         """
 
         if self.status == "running":
-            raise RuntimeError(
+            raise PipelineError(
                 "PipelineRuntime 已经正在运行。"
             )
 
@@ -352,7 +356,7 @@ class PipelineRuntime:
         """
 
         if self.run_id is None:
-            raise RuntimeError(
+            raise PipelineError(
                 "PipelineRuntime 尚未启动。"
             )
 
@@ -409,6 +413,7 @@ class PipelineRuntime:
     # Stage Lifecycle
     # ========================================================
 
+    @logged_operation("pipeline_runtime.start_stage")
     def start_stage(
         self,
         stage_name: str,
@@ -422,7 +427,7 @@ class PipelineRuntime:
         self._ensure_running()
 
         if stage_name not in self.stages:
-            raise ValueError(
+            raise PipelineError(
                 f"未知 Pipeline Stage：{stage_name}"
             )
 
@@ -437,7 +442,7 @@ class PipelineRuntime:
                 current is not None
                 and current.status == "running"
             ):
-                raise RuntimeError(
+                raise PipelineError(
                     "已有 Stage 正在运行："
                     f"{self.current_stage}"
                 )
@@ -492,6 +497,7 @@ class PipelineRuntime:
 
         return record
 
+    @logged_operation("pipeline_runtime.finish_stage")
     def finish_stage(
         self,
         stage_name: Optional[str] = None,
@@ -513,12 +519,12 @@ class PipelineRuntime:
             stage_name = self.current_stage
 
         if stage_name is None:
-            raise RuntimeError(
+            raise PipelineError(
                 "当前没有正在运行的 Stage。"
             )
 
         if stage_name not in self.stages:
-            raise ValueError(
+            raise PipelineError(
                 f"未知 Pipeline Stage：{stage_name}"
             )
 
@@ -555,12 +561,12 @@ class PipelineRuntime:
             stage_name = self.current_stage
 
         if stage_name is None:
-            raise RuntimeError(
+            raise PipelineError(
                 "当前没有正在运行的 Stage。"
             )
 
         if stage_name not in self.stages:
-            raise ValueError(
+            raise PipelineError(
                 f"未知 Pipeline Stage：{stage_name}"
             )
 
@@ -645,7 +651,7 @@ class PipelineRuntime:
         """
 
         if stage_name not in self.stages:
-            raise ValueError(
+            raise PipelineError(
                 f"未知 Pipeline Stage：{stage_name}"
             )
 
@@ -779,13 +785,13 @@ class PipelineRuntime:
         """
 
         if self.status != "running":
-            raise RuntimeError(
+            raise PipelineError(
                 "PipelineRuntime 当前不是 running 状态："
                 f"{self.status}"
             )
 
         if self.run_id is None:
-            raise RuntimeError(
+            raise PipelineError(
                 "PipelineRuntime 正在运行，"
                 "但 run_id 不存在。"
             )

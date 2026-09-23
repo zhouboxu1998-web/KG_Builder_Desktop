@@ -19,3 +19,6 @@ Pillow>=10.0.0
 
 # ---------- 异步 ----------
 nest-asyncio>=1.6.0
+# ---------- API / Production ----------
+fastapi>=0.115.0
+uvicorn>=0.30.0

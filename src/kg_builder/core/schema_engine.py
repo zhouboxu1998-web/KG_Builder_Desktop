@@ -49,6 +49,9 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Optional, Set
 
+from kg_builder.core.errors import SchemaValidationError
+from kg_builder.core.logger import logged_operation
+
 
 class SchemaEngine:
     """
@@ -146,7 +149,7 @@ class SchemaEngine:
             plan = {}
 
         if not isinstance(plan, dict):
-            raise TypeError(
+            raise SchemaValidationError(
                 "Schema plan 必须是 dict。"
             )
 
@@ -180,6 +183,7 @@ class SchemaEngine:
     # Normalize
     # ========================================================
 
+    @logged_operation("schema.normalize_plan")
     def normalize_plan(
         self,
         plan: Dict[str, Any],
@@ -200,7 +204,7 @@ class SchemaEngine:
         """
 
         if not isinstance(plan, dict):
-            raise TypeError(
+            raise SchemaValidationError(
                 "Schema plan 必须是 dict。"
             )
 
@@ -342,6 +346,7 @@ class SchemaEngine:
     # Validation
     # ========================================================
 
+    @logged_operation("schema.validate")
     def validate(
         self,
         plan: Optional[
@@ -700,6 +705,7 @@ class SchemaEngine:
     # Approve
     # ========================================================
 
+    @logged_operation("schema.approve")
     def approve(
         self,
         plan: Optional[
@@ -729,7 +735,7 @@ class SchemaEngine:
 
         if not self.normalized_plan:
 
-            raise ValueError(
+            raise SchemaValidationError(
                 "没有可批准的 Schema。"
             )
 
@@ -739,7 +745,7 @@ class SchemaEngine:
 
         if not validation["valid"]:
 
-            raise ValueError(
+            raise SchemaValidationError(
                 "Schema 验证失败，"
                 "不能批准："
                 + "; ".join(

@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from kg_builder.core.errors import ConfigurationError
+
 
 def generate_event_id() -> str:
     """生成唯一事件 ID。"""
@@ -109,7 +111,7 @@ class RuntimeEventStore:
 
     def __init__(self, max_events: int = 10000):
         if max_events <= 0:
-            raise ValueError("max_events 必须大于 0")
+            raise ConfigurationError("max_events 必须大于 0")
 
         self.max_events = max_events
 

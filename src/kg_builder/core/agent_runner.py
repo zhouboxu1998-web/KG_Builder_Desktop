@@ -26,6 +26,7 @@ Reasoning 泄漏过滤（保守版）：
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from typing import Any, Callable, Dict, Optional
@@ -34,6 +35,11 @@ from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
+
+from kg_builder import config
+from kg_builder.core.errors import AgentExecutionError, KGBuilderError, OperationTimeoutError
+from kg_builder.core.logger import logged_operation
+from kg_builder.core.retry import RetryPolicy, TimeoutPolicy, run_async_with_policy
 
 from kg_builder.core.runtime import (
     AgentRuntime,
@@ -216,6 +222,8 @@ class AgentCaller:
         runtime: Optional[AgentRuntime] = None,
         run_id: Optional[str] = None,
         stage: Optional[str] = None,
+        retry_policy: Optional[RetryPolicy] = None,
+        timeout_policy: Optional[TimeoutPolicy] = None,
     ):
         self.agent = agent
         self.runner = runner
@@ -236,11 +244,25 @@ class AgentCaller:
 
         self.stage = stage
 
+        # Phase 1-C：统一 Retry / Timeout 策略。
+        # 默认最大尝试次数为 1，保持已有 Agent 行为不变。
+        self.retry_policy = retry_policy or RetryPolicy(
+            max_attempts=config.KG_RETRY_MAX_ATTEMPTS,
+            initial_delay=config.KG_RETRY_INITIAL_DELAY,
+            max_delay=config.KG_RETRY_MAX_DELAY,
+            multiplier=config.KG_RETRY_BACKOFF_MULTIPLIER,
+            jitter=config.KG_RETRY_JITTER,
+        )
+
+        self.timeout_policy = timeout_policy or TimeoutPolicy(
+            timeout_seconds=config.AGENT_TIMEOUT_SECONDS,
+        )
+
     # ========================================================
     # Chat
     # ========================================================
 
-    async def chat(
+    async def _chat_once(
         self,
         user_input: str,
         verbose: bool = False,
@@ -408,7 +430,7 @@ class AgentCaller:
 
             return cleaned
 
-        except Exception as exc:
+        except KGBuilderError as exc:
             elapsed_ms = (
                 time.perf_counter()
                 - start_time
@@ -423,6 +445,82 @@ class AgentCaller:
             )
 
             raise
+
+        except Exception as exc:
+            elapsed_ms = (
+                time.perf_counter()
+                - start_time
+            ) * 1000
+
+            wrapped = AgentExecutionError.from_exception(
+                exc,
+                message=(
+                    f"Agent {self.agent.name} 执行失败。"
+                ),
+                details={
+                    "agent": self.agent.name,
+                    "stage": self.stage,
+                },
+            )
+
+            self.runtime.agent_error(
+                run_id=self.run_id,
+                agent_name=self.agent.name,
+                error=wrapped,
+                duration_ms=elapsed_ms,
+                stage=self.stage,
+            )
+
+            raise wrapped from exc
+
+    @logged_operation("agent_caller.chat")
+    async def chat(
+        self,
+        user_input: str,
+        verbose: bool = False,
+        on_chunk: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """
+        带统一 Retry / Timeout 策略的 Agent 调用。
+
+        注意：
+            Agent Tool 可能具有副作用，因此默认 max_attempts=1。
+            如需启用 Agent 重试，应只针对已经确认幂等的 Agent 流程开启。
+        """
+
+        try:
+            return await run_async_with_policy(
+                self._chat_once,
+                user_input,
+                verbose=verbose,
+                on_chunk=on_chunk,
+                retry_policy=self.retry_policy,
+                timeout_policy=self.timeout_policy,
+                operation_name=f"agent:{self.agent.name}",
+            )
+
+        except OperationTimeoutError:
+            raise
+
+        except TimeoutError as error:
+            wrapped = OperationTimeoutError(
+                f"Agent {self.agent.name} 执行超时。",
+                details={
+                    "agent": self.agent.name,
+                    "stage": self.stage,
+                    "timeout_seconds": self.timeout_policy.timeout_seconds,
+                },
+                cause=error,
+            )
+
+            self.runtime.agent_error(
+                run_id=self.run_id,
+                agent_name=self.agent.name,
+                error=wrapped,
+                stage=self.stage,
+            )
+
+            raise wrapped from error
 
     # ========================================================
     # Session
@@ -498,6 +596,8 @@ async def make_agent_caller(
     runtime: Optional[AgentRuntime] = None,
     run_id: Optional[str] = None,
     stage: Optional[str] = None,
+    retry_policy: Optional[RetryPolicy] = None,
+    timeout_policy: Optional[TimeoutPolicy] = None,
 ) -> AgentCaller:
     """
     创建 AgentCaller。
@@ -558,4 +658,6 @@ async def make_agent_caller(
         runtime=runtime,
         run_id=run_id,
         stage=stage,
+        retry_policy=retry_policy,
+        timeout_policy=timeout_policy,
     )

@@ -18,6 +18,7 @@ import asyncio
 
 import customtkinter as ctk
 
+from kg_builder import config
 from kg_builder.agents.pipeline import KGBuilderPipeline
 from kg_builder.core.neo4j_client import graphdb
 from kg_builder.ui.async_bridge import AsyncBridge
@@ -322,38 +323,67 @@ class App(ctk.CTk):
 
     def _on_ping_done(self, future):
         try:
-            ok = future.result()
-        except Exception:
-            ok = False
+            result = future.result()
+        except Exception as error:
+            result = {
+                "connected": False,
+                "error_message": str(error),
+            }
 
         def _update():
-            if ok:
-                self._status_dot.configure(fg_color=COLORS["success"])
-                self._status_label.configure(
-                    text="Neo4j 已连接", text_color=COLORS["success"]
+            if result.get("connected"):
+                self._status_dot.configure(
+                    fg_color=COLORS["success"]
                 )
-            else:
-                self._status_dot.configure(fg_color=COLORS["error"])
                 self._status_label.configure(
-                    text="Neo4j 未连接", text_color=COLORS["error"]
+                    text="Neo4j 已连接",
+                    text_color=COLORS["success"],
                 )
+                return
+
+            message = result.get(
+                "error_message",
+                "Neo4j 服务未连接。",
+            )
+
+            # 左下角保持简洁，只在未连接时显示第一段诊断信息。
+            short_message = message.split("；", 1)[0]
+            if len(short_message) > 28:
+                short_message = short_message[:28] + "…"
+
+            self._status_dot.configure(
+                fg_color=COLORS["error"]
+            )
+            self._status_label.configure(
+                text=f"Neo4j 未连接 · {short_message}",
+                text_color=COLORS["error"],
+            )
 
         try:
             self.after(0, _update)
         except Exception:
             pass
 
-    async def _async_ping(self, timeout: float = 5.0) -> bool:
+    async def _async_ping(self, timeout: float = 5.0) -> dict:
         loop = asyncio.get_running_loop()
+
         try:
             return await asyncio.wait_for(
-                loop.run_in_executor(None, graphdb.ping),
+                loop.run_in_executor(None, graphdb.check_connection),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
-            return False
-        except Exception:
-            return False
+            return {
+                "connected": False,
+                "error_code": "NEO4J_TIMEOUT",
+                "error_message": "Neo4j 连接检查超时。",
+            }
+        except Exception as error:
+            return {
+                "connected": False,
+                "error_code": "NEO4J_HEALTH_CHECK_ERROR",
+                "error_message": str(error),
+            }
 
     # ========================================================
     # 关闭

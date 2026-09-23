@@ -39,6 +39,7 @@ from google.adk.events import Event, EventActions
 
 from kg_builder.agents.fact_agent import build_fact_agent
 from kg_builder.agents.ner_agent import build_ner_agent
+from kg_builder.agents.query_agent import build_query_agent
 from kg_builder.agents.schema_critic import build_schema_critic_agent
 from kg_builder.agents.schema_proposal import build_schema_proposal_agent
 from kg_builder.agents.user_intent import build_user_intent_agent
@@ -47,7 +48,11 @@ from kg_builder.core.agent_runner import (
     make_agent_caller,
 )
 from kg_builder.core.ingestion_engine import IngestionEngine
+from kg_builder.core.errors import PipelineError
 from kg_builder.core.pipeline_runtime import PipelineRuntime
+from kg_builder.core.query_engine import QueryEngine
+from kg_builder.core.query_state import QueryState
+from kg_builder.core.query_runtime import QueryRuntime
 from kg_builder.core.schema_engine import SchemaEngine
 
 from kg_builder.state import (
@@ -189,6 +194,10 @@ class PipelineSession:
         AgentCaller
     ] = None
 
+    query_caller: Optional[
+        AgentCaller
+    ] = None
+
     # 兼容旧字段
     files_caller: Optional[
         AgentCaller
@@ -224,6 +233,8 @@ class PipelineSession:
         self.ner_caller = None
 
         self.fact_caller = None
+
+        self.query_caller = None
 
         self.files_caller = None
 
@@ -278,6 +289,19 @@ class KGBuilderPipeline:
 
         self.schema_engine = SchemaEngine()
         self.ingestion_engine = IngestionEngine()
+
+        # ★ Phase 5-C
+        # QueryEngine 负责查询业务逻辑。
+        # QueryState 负责保存 Query 阶段状态。
+        # 两者都由 Pipeline 持有，但职责保持分离。
+        self.query_engine = QueryEngine()
+        self.query_state = QueryState()
+        # ★ Phase 5-D
+        # QueryRuntime 负责一轮 Query 的执行生命周期、耗时与运行元数据。
+        self.query_runtime = QueryRuntime(
+            query_engine=self.query_engine,
+            query_state=self.query_state,
+        )
 
     # ========================================================
     # 内部工具
@@ -1378,6 +1402,136 @@ class KGBuilderPipeline:
             )
 
     # ========================================================
+    # Query Agent / Query Run
+    # ========================================================
+
+    def ensure_query_run(
+        self,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """确保 Query 有一个正在运行的 Pipeline Run。"""
+
+        if self.runtime.status == "running":
+            if self.runtime.current_stage is not None:
+                current = self.runtime.stages.get(
+                    self.runtime.current_stage
+                )
+
+                if (
+                    current is not None
+                    and current.status == "running"
+                    and self.runtime.current_stage != "query"
+                ):
+                    raise PipelineError(
+                        "当前已有 Pipeline Stage 正在运行："
+                        f"{self.runtime.current_stage}"
+                    )
+
+            return self.get_run_id() or ""
+
+        run_id = self.start_run(
+            metadata={
+                "entrypoint": "query",
+                **(metadata or {}),
+            }
+        )
+
+        # 一个新的 Pipeline Run 必须使用新的 Query Agent Session。
+        self.session.query_caller = None
+
+        self.query_runtime.reset()
+
+        return run_id
+
+    async def start_query_agent(
+        self,
+    ) -> AgentCaller:
+        """创建并返回 Query Agent Caller。"""
+
+        self.ensure_query_run(
+            metadata={
+                "mode": "query_agent",
+            }
+        )
+
+        if self.session.query_caller is not None:
+            return self.session.query_caller
+
+        agent = build_query_agent(
+            self.query_runtime
+        )
+
+        self.session.query_caller = (
+            await make_agent_caller(
+                agent,
+                initial_state={},
+                runtime=self.runtime.agent_runtime,
+                run_id=self.runtime.run_id,
+                stage="query",
+            )
+        )
+
+        return self.session.query_caller
+
+    async def query_chat(
+        self,
+        user_input: str,
+        on_chunk=None,
+    ) -> str:
+        """通过 Query Agent 处理一轮自然语言知识图谱查询。"""
+
+        self.ensure_query_run(
+            metadata={
+                "mode": "query_agent",
+            }
+        )
+
+        self.start_query_stage()
+
+        try:
+
+            caller = await self.start_query_agent()
+
+            response = await caller.chat(
+                user_input,
+                on_chunk=on_chunk,
+            )
+
+            self.session.stage_states[
+                "query"
+            ] = self.query_state.snapshot()
+
+            if self.query_state.status == "error":
+                self.finish_query_stage(
+                    success=False,
+                    error=self.query_state.error_message,
+                )
+            else:
+                self.finish_query_stage(
+                    success=True
+                )
+
+            return response
+
+        except Exception as error:
+
+            self.query_state.status = "error"
+            self.query_state.error_message = str(
+                error
+            )
+
+            self.session.stage_states[
+                "query"
+            ] = self.query_state.snapshot()
+
+            self.finish_query_stage(
+                success=False,
+                error=str(error),
+            )
+
+            raise
+
+    # ========================================================
     # Stage 8 Query
     # ========================================================
 
@@ -1385,11 +1539,44 @@ class KGBuilderPipeline:
         self,
     ) -> None:
         """
-        Stage 8 Runtime Hook。
+        启动 Stage 8 Query Runtime。
 
-        Phase 2 只增加 Runtime 生命周期，
-        不改变 Query 业务逻辑。
+        Phase 5-C：
+
+            Runtime
+                +
+            QueryState
+
+        开始一轮新的 Query 前，先清空上一轮 Query
+        的阶段状态，避免旧结果残留到新请求。
+
+        注意：
+
+            这里不会执行 Cypher。
+            真正的查询仍然由 QueryEngine 完成。
         """
+
+        self.query_runtime.bind(
+            query_engine=self.query_engine,
+            query_state=self.query_state,
+        )
+
+        # Query 可以直接从 UI 进入，不要求调用方必须提前 start_run()。
+        # 如果没有活动的 Pipeline Run，这里自动创建一个。
+        if self.runtime.status != "running":
+            self.ensure_query_run(
+                metadata={
+                    "entrypoint": "query",
+                    "mode": "query_stage",
+                }
+            )
+
+        self.query_runtime.reset_state_only()
+
+        self.session.stage_states.pop(
+            "query",
+            None,
+        )
 
         self.runtime.start_stage(
             "query",
@@ -1402,7 +1589,7 @@ class KGBuilderPipeline:
         error: Optional[str] = None,
     ) -> None:
         """
-        完成 Stage 8 Runtime Hook。
+        完成 Stage 8 Runtime，并保持 Query State 同步。
         """
 
         if success:
@@ -1418,6 +1605,143 @@ class KGBuilderPipeline:
                 "query",
                 error=error,
             )
+
+    async def query(
+        self,
+        cypher: str,
+        parameters: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        """
+        执行 Stage 8 Query。
+
+        流程：
+
+            Pipeline.query()
+                ↓
+            start_query_stage()
+                ↓
+            QueryEngine.query()
+                ↓
+            QueryState.update_from_report()
+                ↓
+            session.stage_states["query"]
+                ↓
+            finish_query_stage()
+
+        QueryEngine 负责查询。
+        QueryState 负责状态。
+        Pipeline 负责把两者接入 Runtime / Session。
+
+        Args:
+            cypher:
+                要执行的 Cypher。
+
+            parameters:
+                Cypher 参数。
+
+        Returns:
+            QueryEngine 的标准化查询结果。
+        """
+
+        # Query 是独立 UI / Agent 入口。
+        # 没有活动 Run 时自动创建，避免用户首次提问得到：
+        # "PipelineRuntime 当前不是 running 状态：idle"。
+        if self.runtime.status != "running":
+            self.ensure_query_run(
+                metadata={
+                    "entrypoint": "query",
+                    "mode": "direct_cypher",
+                }
+            )
+
+        self.start_query_stage()
+
+        try:
+
+            # Phase 5-D：
+            # QueryRuntime 负责 Query 执行生命周期以及 runtime metadata。
+            # 每次执行前重新绑定依赖，保持与 Phase 5-C 的可测试注入兼容。
+            self.query_runtime.bind(
+                query_engine=self.query_engine,
+                query_state=self.query_state,
+            )
+
+            result = self.query_runtime.execute(
+                cypher=cypher,
+                parameters=parameters,
+                run_id=self.get_run_id(),
+            )
+
+            self.session.stage_states[
+                "query"
+            ] = self.query_state.snapshot()
+
+            if result.get("status") == "success":
+
+                self.finish_query_stage(
+                    success=True
+                )
+
+            else:
+
+                self.finish_query_stage(
+                    success=False,
+                    error=result.get(
+                        "error_message",
+                        "Query 执行失败。",
+                    ),
+                )
+
+            return result
+
+        except Exception as error:
+
+            # 正常情况下 QueryEngine 会把数据库异常
+            # 转换成 error report。
+            # 这里仍保留 Pipeline 级兜底。
+            self.query_state.status = "error"
+            self.query_state.error_message = str(
+                error
+            )
+
+            self.session.stage_states[
+                "query"
+            ] = self.query_state.snapshot()
+
+            self.finish_query_stage(
+                success=False,
+                error=str(error),
+            )
+
+            raise
+
+    async def get_query_state(
+        self,
+    ) -> Dict[str, Any]:
+        """获取最近一次 Query 阶段状态。"""
+
+        return self.query_state.snapshot()
+
+    def get_query_report(
+        self,
+    ) -> Dict[str, Any]:
+        """获取最近一次 QueryRuntime 报告。"""
+
+        return self.query_runtime.get_report()
+
+    def reset_query(
+        self,
+    ) -> None:
+        """重置 QueryRuntime、QueryEngine、QueryState 和 Query stage state。"""
+
+        self.query_runtime.reset()
+
+        self.session.query_caller = None
+
+        self.session.stage_states.pop(
+            "query",
+            None,
+        )
 
     # ========================================================
     # 全流程测试
@@ -1593,6 +1917,9 @@ class KGBuilderPipeline:
         stage: str,
     ) -> Dict[str, Any]:
 
+        if stage == "query":
+            return self.query_state.snapshot()
+
         caller_map = {
 
             "intent":
@@ -1638,6 +1965,7 @@ class KGBuilderPipeline:
         self._approved_schema_plan = None
         self.schema_engine.reset()
         self.ingestion_engine.reset()
+        self.query_runtime.reset()
         self.runtime.reset()
 
 
